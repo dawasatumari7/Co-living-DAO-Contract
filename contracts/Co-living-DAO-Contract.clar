@@ -8,12 +8,15 @@
 (define-constant ERR-BILL-NOT-FOUND (err u107))
 (define-constant ERR-BILL-ALREADY-PAID (err u108))
 (define-constant ERR-INVALID-AMOUNT (err u109))
+(define-constant ERR-RENT-ALREADY-PAID (err u110))
+(define-constant ERR-RENT-NOT-DUE (err u111))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-bill-id uint u1)
 (define-data-var house-balance uint u0)
 (define-data-var monthly-rent uint u0)
+(define-data-var rent-cycle-start uint u0)
 
 (define-map members principal 
     {
@@ -67,6 +70,15 @@
     }
 )
 
+(define-map monthly-rent-payments {member: principal, cycle: uint}
+    {
+        paid: bool,
+        amount: uint,
+        paid-at: uint,
+        due-date: uint
+    }
+)
+
 (define-map house-rules (string-ascii 50)
     {
         rule: (string-utf8 200),
@@ -79,6 +91,7 @@
     (begin
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
         (var-set monthly-rent initial-rent)
+        (var-set rent-cycle-start stacks-block-height)
         (ok true)
     )
 )
@@ -305,6 +318,52 @@
     )
 )
 
+(define-public (pay-monthly-rent)
+    (let
+        (
+            (member-data (unwrap! (map-get? members tx-sender) ERR-NOT-MEMBER))
+            (current-cycle (get-current-rent-cycle))
+            (rent-amount (var-get monthly-rent))
+            (existing-payment (map-get? monthly-rent-payments {member: tx-sender, cycle: current-cycle}))
+            (cycle-start (var-get rent-cycle-start))
+            (cycle-due-date (+ cycle-start (* current-cycle u4320)))
+        )
+        (asserts! (get active member-data) ERR-NOT-MEMBER)
+        (asserts! (> rent-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (>= stacks-block-height cycle-due-date) ERR-RENT-NOT-DUE)
+        (asserts! (is-none existing-payment) ERR-RENT-ALREADY-PAID)
+        
+        (try! (stx-transfer? rent-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set monthly-rent-payments {member: tx-sender, cycle: current-cycle}
+            {
+                paid: true,
+                amount: rent-amount,
+                paid-at: stacks-block-height,
+                due-date: cycle-due-date
+            }
+        )
+        
+        (var-set house-balance (+ (var-get house-balance) rent-amount))
+        (ok current-cycle)
+    )
+)
+
+(define-public (get-rent-status (member principal))
+    (let
+        (
+            (current-cycle (get-current-rent-cycle))
+            (payment-data (map-get? monthly-rent-payments {member: member, cycle: current-cycle}))
+        )
+        (ok {
+            cycle: current-cycle,
+            paid: (is-some payment-data),
+            amount: (var-get monthly-rent),
+            due-date: (+ (var-get rent-cycle-start) (* current-cycle u4320))
+        })
+    )
+)
+
 (define-read-only (get-member-info (member principal))
     (map-get? members member)
 )
@@ -342,6 +401,22 @@
 
 (define-read-only (get-vote (proposal-id uint) (voter principal))
     (map-get? votes {proposal-id: proposal-id, voter: voter})
+)
+
+(define-read-only (get-monthly-rent-payment (member principal) (cycle uint))
+    (map-get? monthly-rent-payments {member: member, cycle: cycle})
+)
+
+(define-read-only (get-current-rent-cycle)
+    (let
+        (
+            (cycle-start (var-get rent-cycle-start))
+        )
+        (if (> cycle-start u0)
+            (/ (- stacks-block-height cycle-start) u4320)
+            u0
+        )
+    )
 )
 
 (define-private (get-active-member-count)
