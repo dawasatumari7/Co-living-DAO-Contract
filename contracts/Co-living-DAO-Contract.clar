@@ -10,10 +10,14 @@
 (define-constant ERR-INVALID-AMOUNT (err u109))
 (define-constant ERR-RENT-ALREADY-PAID (err u110))
 (define-constant ERR-RENT-NOT-DUE (err u111))
+(define-constant ERR-REQUEST-NOT-FOUND (err u112))
+(define-constant ERR-INVALID-STATUS (err u113))
+(define-constant ERR-INVALID-PRIORITY (err u114))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-bill-id uint u1)
+(define-data-var next-request-id uint u1)
 (define-data-var house-balance uint u0)
 (define-data-var monthly-rent uint u0)
 (define-data-var rent-cycle-start uint u0)
@@ -84,6 +88,31 @@
         rule: (string-utf8 200),
         active: bool,
         created-at: uint
+    }
+)
+
+(define-map maintenance-requests uint
+    {
+        title: (string-utf8 100),
+        description: (string-utf8 300),
+        location: (string-ascii 50),
+        priority: (string-ascii 10),
+        status: (string-ascii 15),
+        requester: principal,
+        assigned-to: (optional principal),
+        estimated-cost: uint,
+        created-at: uint,
+        completed-at: (optional uint),
+        votes-approve: uint,
+        votes-reject: uint,
+        voting-ends: uint
+    }
+)
+
+(define-map request-votes {request-id: uint, voter: principal}
+    {
+        approve: bool,
+        voted-at: uint
     }
 )
 
@@ -416,6 +445,137 @@
             (/ (- stacks-block-height cycle-start) u4320)
             u0
         )
+    )
+)
+
+(define-public (create-maintenance-request (title (string-utf8 100)) (description (string-utf8 300))
+                                       (location (string-ascii 50)) (priority (string-ascii 10)) 
+                                       (estimated-cost uint))
+    (let
+        (
+            (request-id (var-get next-request-id))
+            (member-data (unwrap! (map-get? members tx-sender) ERR-NOT-MEMBER))
+        )
+        (asserts! (get active member-data) ERR-NOT-MEMBER)
+        (asserts! (or (is-eq priority "low") (or (is-eq priority "medium") (is-eq priority "high"))) ERR-INVALID-PRIORITY)
+        
+        (map-set maintenance-requests request-id
+            {
+                title: title,
+                description: description,
+                location: location,
+                priority: priority,
+                status: "pending",
+                requester: tx-sender,
+                assigned-to: none,
+                estimated-cost: estimated-cost,
+                created-at: stacks-block-height,
+                completed-at: none,
+                votes-approve: u0,
+                votes-reject: u0,
+                voting-ends: (+ stacks-block-height u144)
+            }
+        )
+        (var-set next-request-id (+ request-id u1))
+        (ok request-id)
+    )
+)
+
+(define-public (vote-on-maintenance-request (request-id uint) (approve bool))
+    (let
+        (
+            (request (unwrap! (map-get? maintenance-requests request-id) ERR-REQUEST-NOT-FOUND))
+            (member-data (unwrap! (map-get? members tx-sender) ERR-NOT-MEMBER))
+            (existing-vote (map-get? request-votes {request-id: request-id, voter: tx-sender}))
+        )
+        (asserts! (get active member-data) ERR-NOT-MEMBER)
+        (asserts! (<= stacks-block-height (get voting-ends request)) ERR-VOTING-ENDED)
+        (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
+        (asserts! (is-eq (get status request) "pending") ERR-INVALID-STATUS)
+        
+        (map-set request-votes {request-id: request-id, voter: tx-sender}
+            {
+                approve: approve,
+                voted-at: stacks-block-height
+            }
+        )
+        
+        (if approve
+            (map-set maintenance-requests request-id
+                (merge request {votes-approve: (+ (get votes-approve request) u1)})
+            )
+            (map-set maintenance-requests request-id
+                (merge request {votes-reject: (+ (get votes-reject request) u1)})
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-request-status (request-id uint) (new-status (string-ascii 15)))
+    (let
+        (
+            (request (unwrap! (map-get? maintenance-requests request-id) ERR-REQUEST-NOT-FOUND))
+            (member-data (unwrap! (map-get? members tx-sender) ERR-NOT-MEMBER))
+        )
+        (asserts! (get active member-data) ERR-NOT-MEMBER)
+        (asserts! (or (is-eq new-status "approved") (or (is-eq new-status "in-progress") 
+                     (or (is-eq new-status "completed") (is-eq new-status "rejected")))) ERR-INVALID-STATUS)
+        (asserts! (> stacks-block-height (get voting-ends request)) ERR-VOTING-ENDED)
+        
+        (if (is-eq new-status "completed")
+            (map-set maintenance-requests request-id
+                (merge request {
+                    status: new-status,
+                    completed-at: (some stacks-block-height)
+                })
+            )
+            (map-set maintenance-requests request-id
+                (merge request {status: new-status})
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (assign-maintenance-request (request-id uint) (assignee principal))
+    (let
+        (
+            (request (unwrap! (map-get? maintenance-requests request-id) ERR-REQUEST-NOT-FOUND))
+            (member-data (unwrap! (map-get? members tx-sender) ERR-NOT-MEMBER))
+            (assignee-data (unwrap! (map-get? members assignee) ERR-NOT-MEMBER))
+        )
+        (asserts! (get active member-data) ERR-NOT-MEMBER)
+        (asserts! (get active assignee-data) ERR-NOT-MEMBER)
+        (asserts! (is-eq (get status request) "approved") ERR-INVALID-STATUS)
+        
+        (map-set maintenance-requests request-id
+            (merge request {
+                assigned-to: (some assignee),
+                status: "in-progress"
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-maintenance-request (request-id uint))
+    (map-get? maintenance-requests request-id)
+)
+
+(define-read-only (get-request-vote (request-id uint) (voter principal))
+    (map-get? request-votes {request-id: request-id, voter: voter})
+)
+
+(define-read-only (get-request-voting-result (request-id uint))
+    (match (map-get? maintenance-requests request-id)
+        request (ok {
+            approved: (> (get votes-approve request) (get votes-reject request)),
+            votes-approve: (get votes-approve request),
+            votes-reject: (get votes-reject request),
+            voting-ended: (> stacks-block-height (get voting-ends request))
+        })
+        ERR-REQUEST-NOT-FOUND
     )
 )
 
