@@ -20,12 +20,16 @@
 (define-constant MEMBERSHIP-FEE u1000000) ;; 1 STX in microSTX
 (define-constant PROPOSAL-DURATION u1440) ;; 1440 blocks (~10 days)
 (define-constant QUORUM-THRESHOLD u50) ;; 50% participation required
+(define-constant CONTRIBUTION-VOTE-POINTS u1)
+(define-constant CONTRIBUTION-PROPOSAL-POINTS u5)
+(define-constant CONTRIBUTION-BOOKING-POINTS u2)
 
 ;; Data Variables
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-space-id uint u1)
 (define-data-var treasury-balance uint u0)
 (define-data-var total-members uint u0)
+(define-data-var next-contribution-id uint u1)
 
 ;; Data Maps
 (define-map members principal {
@@ -60,6 +64,16 @@
 
 (define-map space-occupants { space-id: uint, occupant: principal } uint)
 
+(define-map contributions uint {
+    contributor: principal,
+    contribution-type: (string-ascii 16),
+    points: uint,
+    created-at: uint,
+    reference-id: uint
+})
+
+(define-map member-contribution-score principal uint)
+
 ;; Private Functions
 (define-private (is-member (user principal))
     (match (map-get? members user)
@@ -76,6 +90,24 @@
     (match (map-get? members user)
         member (+ u1 (/ (get reputation member) u100))
         u0
+    )
+)
+
+(define-private (record-contribution (member principal) (contribution-type (string-ascii 16)) (points uint) (reference-id uint))
+    (let (
+        (contribution-id (var-get next-contribution-id))
+        (current-score (default-to u0 (map-get? member-contribution-score member)))
+    )
+        (map-set contributions contribution-id {
+            contributor: member,
+            contribution-type: contribution-type,
+            points: points,
+            created-at: block-height,
+            reference-id: reference-id
+        })
+        (map-set member-contribution-score member (+ current-score points))
+        (var-set next-contribution-id (+ contribution-id u1))
+        contribution-id
     )
 )
 
@@ -145,6 +177,7 @@
             proposal-type: proposal-type
         })
         (var-set next-proposal-id (+ proposal-id u1))
+        (record-contribution caller "proposal" CONTRIBUTION-PROPOSAL-POINTS proposal-id)
         (ok proposal-id)
     )
 )
@@ -169,6 +202,7 @@
                     (map-set proposals proposal-id 
                         (merge proposal { no-votes: (+ (get no-votes proposal) voting-power) }))
                 )
+                (record-contribution caller "vote" CONTRIBUTION-VOTE-POINTS proposal-id)
                 (ok true)
             )
             ERR-PROPOSAL-NOT-FOUND
@@ -252,6 +286,7 @@
                 )
                 
                 (var-set treasury-balance (+ (var-get treasury-balance) (get monthly-fee space)))
+                (record-contribution caller "booking" CONTRIBUTION-BOOKING-POINTS space-id)
                 (ok true)
             )
             ERR-SPACE-NOT-FOUND
@@ -329,4 +364,16 @@
 
 (define-read-only (is-space-occupant (space-id uint) (occupant principal))
     (is-some (map-get? space-occupants { space-id: space-id, occupant: occupant }))
+)
+
+(define-read-only (get-member-contribution-score (member principal))
+    (default-to u0 (map-get? member-contribution-score member))
+)
+
+(define-read-only (get-contribution-info (contribution-id uint))
+    (map-get? contributions contribution-id)
+)
+
+(define-read-only (get-leaderboard-rank (member principal))
+    (get-member-contribution-score member)
 )
